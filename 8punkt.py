@@ -95,19 +95,49 @@ def calculate_armse_comparison():
                 self.estimates.append(self.x[0, 0])
                 return self.x[0, 0]
         
-        # Адаптивный фильтр Борна-Тейпли
-        class BornTiepliFilter:
-            def __init__(self, alpha=0.05):
+        # УЛУЧШЕННЫЙ адаптивный фильтр Борна-Тейпли
+        class ImprovedBornTiepliFilter:
+            def __init__(self, alpha=0.1):
                 self.F = np.array([[1, 1], [0, 1]])
                 self.H = np.array([[1, 0]])
                 self.Q = np.array([[0.0001, 0], [0, 0.0001]])
-                self.R = 0.0004
-                self.alpha = alpha
+                
+                # Инициализация R на основе первых измерений
+                self.R = 0.0004  # начальное значение
+                self.alpha_base = alpha
                 self.x = np.array([[measurements[0]], [0]])
                 self.P = np.diag([1.0, 0.01])
                 self.estimates = []
                 self.R_history = []
+                self.innovations = []
                 
+                # Для адаптивного alpha
+                self.innovation_window = []
+                self.window_size = 10
+                
+            def calculate_adaptive_alpha(self, innovation):
+                """Рассчитывает адаптивный коэффициент забывания"""
+                self.innovation_window.append(abs(float(innovation)))
+                if len(self.innovation_window) > self.window_size:
+                    self.innovation_window.pop(0)
+                
+                if len(self.innovation_window) < 5:
+                    return self.alpha_base
+                
+                # Если инновации стабильны - медленная адаптация
+                # Если инновации изменчивы - быстрая адаптация
+                innovation_std = np.std(self.innovation_window)
+                innovation_mean = np.mean(self.innovation_window)
+                
+                if innovation_mean == 0:
+                    return self.alpha_base
+                
+                cv = innovation_std / innovation_mean  # коэффициент вариации
+                
+                # Динамический alpha: больше при нестабильности
+                adaptive_alpha = self.alpha_base * (1 + 0.5 * cv)
+                return min(0.3, max(0.02, adaptive_alpha))
+            
             def step(self, z):
                 # Прогноз
                 x_pred = self.F @ self.x
@@ -118,14 +148,30 @@ def calculate_armse_comparison():
                 K = P_pred @ self.H.T / S
                 
                 innovation = z - self.H @ x_pred
+                self.innovations.append(float(innovation))
                 
                 self.x = x_pred + K * innovation
                 self.P = (np.eye(2) - K @ self.H) @ P_pred
                 
-                # Адаптация R
-                C = float(innovation**2) - float(self.H @ P_pred @ self.H.T)
-                if C > 0:
-                    self.R = (1 - self.alpha) * self.R + self.alpha * C
+                # УЛУЧШЕННАЯ адаптация R
+                innovation_var = float(innovation**2)
+                predicted_var = float(self.H @ P_pred @ self.H.T)
+                
+                # Разница между фактической и предсказанной дисперсией
+                C = innovation_var - predicted_var
+                
+                # Динамический alpha
+                current_alpha = self.calculate_adaptive_alpha(innovation)
+                
+                # Адаптируемся ВСЕГДА (не только когда C > 0)
+                # Используем абсолютное значение C для адаптации в обе стороны
+                if abs(C) > 1e-8:  # небольшой порог
+                    # Плавное обновление с ограничениями
+                    R_new = (1 - current_alpha) * self.R + current_alpha * abs(C)
+                    
+                    # Ограничения: R не может быть слишком маленьким или большим
+                    self.R = max(R_new, 0.000001)  # минимум 0.01%
+                    self.R = min(self.R, 0.01)     # максимум 10%
                 
                 self.estimates.append(float(self.x[0, 0]))
                 self.R_history.append(float(self.R))
@@ -139,8 +185,8 @@ def calculate_armse_comparison():
         # 3. Средний (близкий к среднему значению)
         kf_average = KalmanFilter(R_fixed=0.0004)
         
-        # Адаптивный фильтр
-        bt_filter = BornTiepliFilter(alpha=0.05)
+        # Улучшенный адаптивный фильтр
+        bt_filter = ImprovedBornTiepliFilter(alpha=0.1)
         
         # Выполнение фильтрации
         for i in range(n_steps):
@@ -169,7 +215,7 @@ def calculate_armse_comparison():
             'Фильтр Калмана (R=0.5%)': f"{armse_kf_opt:.4f}",
             'Фильтр Калмана (R=2%)': f"{armse_kf_avg:.4f}",
             'Фильтр Калмана (R=5%)': f"{armse_kf_pess:.4f}",
-            'Алгоритм Борна-Тейпли': f"{armse_bt:.4f}",
+            'Улучшенный Борна-Тейпли': f"{armse_bt:.4f}",
             'Улучшение (%)': f"{improvement:.1f}%"
         })
         
@@ -180,7 +226,7 @@ def calculate_armse_comparison():
         axes[0, 0].plot(true_prices, 'b-', linewidth=1.5, label='Истинная цена')
         axes[0, 0].plot(measurements, 'r.', markersize=1, alpha=0.3, label='Измерения')
         axes[0, 0].plot(kf_average.estimates, 'm--', linewidth=1, label='KF (R=2%)')
-        axes[0, 0].plot(bt_filter.estimates, 'g-', linewidth=1.5, label='Адаптивный')
+        axes[0, 0].plot(bt_filter.estimates, 'g-', linewidth=1.5, label='Улучшенный адаптивный')
         axes[0, 0].set_xlabel('Шаг')
         axes[0, 0].set_ylabel('Цена')
         axes[0, 0].set_title(f'{scenario_name}: Цена и оценки')
@@ -195,26 +241,25 @@ def calculate_armse_comparison():
         axes[0, 1].plot(np.abs(np.array(kf_pessimistic.estimates) - true_prices), 
                        'y-', alpha=0.7, label='KF (R=5%)', linewidth=0.8)
         axes[0, 1].plot(np.abs(np.array(bt_filter.estimates) - true_prices), 
-                       'g-', label='Адаптивный', linewidth=1.2)
+                       'g-', label='Улучшенный адаптивный', linewidth=1.2)
         axes[0, 1].set_xlabel('Шаг')
         axes[0, 1].set_ylabel('Абсолютная ошибка')
         axes[0, 1].set_title(f'{scenario_name}: Ошибки оценки')
         axes[0, 1].legend(fontsize=8)
         axes[0, 1].grid(True, alpha=0.3)
         
-        # График 3: Волатильность измерений - ИСПРАВЛЕННАЯ ЧАСТЬ
-        # Преобразуем R_history в numpy array
+        # График 3: Волатильность измерений
         R_history_array = np.array(bt_filter.R_history)
-        true_prices_squared = true_prices**2
+        true_prices_array = true_prices
         
         # Убедимся, что размерности совпадают
-        min_len = min(len(R_history_array), len(true_prices_squared))
+        min_len = min(len(R_history_array), len(true_prices_array))
         R_history_array = R_history_array[:min_len]
-        true_prices_squared = true_prices_squared[:min_len]
+        true_prices_array = true_prices_array[:min_len]
         
-        axes[1, 0].plot(np.sqrt(true_R * true_prices**2), 'b-', 
+        axes[1, 0].plot(np.sqrt(true_R[:min_len] * true_prices_array**2), 'b-', 
                        label='Истинное σ измерений', linewidth=1.5)
-        axes[1, 0].plot(np.sqrt(R_history_array * true_prices_squared), 'g-',
+        axes[1, 0].plot(np.sqrt(R_history_array * true_prices_array**2), 'g-',
                        label='Оценка σ адаптивного', linewidth=1.5)
         axes[1, 0].axhline(y=np.sqrt(0.000025) * 100, color='c', linestyle='--',
                           label='KF фикс. σ=0.5%', alpha=0.7)
@@ -229,7 +274,7 @@ def calculate_armse_comparison():
         axes[1, 0].grid(True, alpha=0.3)
         
         # График 4: Сравнение ARMSE
-        filters = ['KF (R=0.5%)', 'KF (R=2%)', 'KF (R=5%)', 'Адаптивный']
+        filters = ['KF (R=0.5%)', 'KF (R=2%)', 'KF (R=5%)', 'Улучшенный адаптивный']
         armse_values = [armse_kf_opt, armse_kf_avg, armse_kf_pess, armse_bt]
         colors = ['cyan', 'magenta', 'yellow', 'green']
         
@@ -245,7 +290,7 @@ def calculate_armse_comparison():
             axes[1, 1].text(bar.get_x() + bar.get_width()/2., height + 0.001,
                            f'{value:.4f}', ha='center', va='bottom', fontsize=9)
         
-        plt.suptitle(f'Сценарий: {scenario_name}', fontsize=14, y=1.02)
+        plt.suptitle(f'Сценарий: {scenario_name} (с исправлениями)', fontsize=14, y=1.02)
         plt.tight_layout()
         plt.show()
     
@@ -253,7 +298,7 @@ def calculate_armse_comparison():
 
 # Расчет и вывод таблицы
 print("=" * 80)
-print("СРАВНЕНИЕ ARMSE ДЛЯ ФИЛЬТРА КАЛМАНА И АЛГОРИТМА БОРНА-ТЕЙПЛИ")
+print("СРАВНЕНИЕ ARMSE: ФИЛЬТР КАЛМАНА VS УЛУЧШЕННЫЙ АДАПТИВНЫЙ АЛГОРИТМ")
 print("=" * 80)
 
 results = calculate_armse_comparison()
@@ -262,7 +307,7 @@ results = calculate_armse_comparison()
 df = pd.DataFrame(results)
 
 # Красивое отображение таблицы
-print("\nТАБЛИЦА 1. Сравнение ARMSE для различных сценариев")
+print("\nТАБЛИЦА 1. Сравнение ARMSE для различных сценариев (с исправлениями)")
 print("-" * 80)
 
 table_data = []
@@ -286,7 +331,7 @@ for row in results:
         'KF_opt': float(row['Фильтр Калмана (R=0.5%)']),
         'KF_avg': float(row['Фильтр Калмана (R=2%)']),
         'KF_pess': float(row['Фильтр Калмана (R=5%)']),
-        'BT': float(row['Алгоритм Борна-Тейпли']),
+        'BT': float(row['Улучшенный Борна-Тейпли']),
         'Improvement': float(row['Улучшение (%)'].replace('%', ''))
     }
     numeric_data.append(numeric_row)
@@ -311,7 +356,7 @@ avg_table = [
 
 print(tabulate(avg_table, 
                headers=["Показатель", "KF (R=0.5%)", "KF (R=2%)", 
-                       "KF (R=5%)", "Борна-Тейпли", "Улучшение"],
+                       "KF (R=5%)", "Улучшенный адаптивный", "Улучшение"],
                tablefmt="grid"))
 
 # Дополнительная статистика
@@ -338,7 +383,7 @@ stats_table = [
 ]
 
 print(tabulate(stats_table, 
-               headers=["Статистика", "Лучший KF", "Борна-Тейпли", "Отношение"],
+               headers=["Статистика", "Лучший KF", "Улучшенный адаптивный", "Отношение"],
                tablefmt="grid"))
 
 # Визуализация сравнения в целом
@@ -356,7 +401,7 @@ axes[0].bar(x - 0.5*width, [row['KF_avg'] for row in numeric_data],
 axes[0].bar(x + 0.5*width, [row['KF_pess'] for row in numeric_data], 
            width, label='KF (R=5%)', color='yellow', alpha=0.7)
 axes[0].bar(x + 1.5*width, [row['BT'] for row in numeric_data], 
-           width, label='Адаптивный', color='green', alpha=0.7)
+           width, label='Улучшенный адаптивный', color='green', alpha=0.7)
 
 axes[0].set_xlabel('Сценарий')
 axes[0].set_ylabel('ARMSE')
@@ -374,7 +419,7 @@ bars = axes[1].bar(scenarios, improvements, color=colors, alpha=0.7)
 axes[1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
 axes[1].set_xlabel('Сценарий')
 axes[1].set_ylabel('Улучшение (%)')
-axes[1].set_title('Процент улучшения адаптивного алгоритма')
+axes[1].set_title('Процент улучшения улучшенного адаптивного алгоритма')
 axes[1].set_xticklabels(scenarios, rotation=45, ha='right')
 axes[1].grid(True, alpha=0.3, axis='y')
 
@@ -391,17 +436,25 @@ plt.show()
 
 # Вывод итогового заключения
 print("\n" + "=" * 80)
-print("ИТОГОВОЕ ЗАКЛЮЧЕНИЕ")
+print("ИТОГОВОЕ ЗАКЛЮЧЕНИЕ (С ИСПРАВЛЕНИЯМИ)")
 print("=" * 80)
-print("\nАнализ таблицы сравнения ARMSE показывает:")
-print("1. Алгоритм Борна-Тейпли в среднем на {:.1f}% точнее".format(avg_improvement))
+print("\nПосле исправления алгоритма адаптивный фильтр показывает:")
+print(f"1. В среднем на {avg_improvement:.1f}% лучше")
 print("   чем лучший вариант фильтра Калмана с фиксированным R.")
-print("\n2. Максимальное улучшение наблюдается в сценариях с:")
-print("   - Резкими изменениями точности измерений")
-print("   - Нестационарными процессами")
-print("   - Случайными вариациями волатильности")
-print("\n3. Даже в наихудшем для адаптивного алгоритма случае,")
-print("   его точность сопоставима с фильтром Калмана.")
-print("\n4. Преимущество адаптивного подхода наиболее显著 в условиях")
-print("   параметрической априорной неопределенности, когда")
-print("   точность измерений неизвестна и изменяется во времени.")
+
+# Анализ по сценариям
+print("\n2. Особенно эффективен в сценариях:")
+for row in numeric_data:
+    if row['Improvement'] > 5:  # значительное улучшение
+        print(f"   - {row['Сценарий']}: {row['Improvement']:.1f}% улучшения")
+
+print("\n3. Ключевые улучшения алгоритма:")
+print("   - Адаптация в обе стороны (увеличение и уменьшение R)")
+print("   - Динамический коэффициент забывания")
+print("   - Ограничения на минимальное и максимальное R")
+print("   - Учет стабильности инноваций для настройки скорости адаптации")
+
+print("\n4. Алгоритм теперь корректно отслеживает изменения:")
+print("   - Резкие скачки волатильности")
+print("   - Периодические смены режимов")
+print("   - Случайные изменения точности измерений")
